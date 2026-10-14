@@ -51,6 +51,8 @@ from hindsight_api.extensions.operation_validator import (
     CreateBankContext,
     # File Conversion
     FileConvertResult,
+    # Transfer imports
+    ImportContext,
     # Memory curation
     MemoryCurationAction,
     MemoryUpdateContext,
@@ -72,6 +74,7 @@ from hindsight_api.extensions.operation_validator import (
     RetainAttachmentInfo,
     RetainContext,
     RetainResult,
+    RetainSource,
     TagScopeContext,
     ValidationResult,
 )
@@ -109,6 +112,8 @@ __all__ = [
     "RetainAttachmentInfo",
     "RetainContext",
     "RetainResult",
+    "RetainSource",
+    "ImportContext",
     "ValidationResult",
     # Operation Validator - Bank Management
     "BankListContext",
