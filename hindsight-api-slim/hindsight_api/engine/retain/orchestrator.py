@@ -2777,6 +2777,15 @@ async def _streaming_retain_batch(
                     attachment_loader=attachment_loader,
                     vlm_config=vlm_config,
                 )
+            except Exception as exc:
+                # Recorded here, not after the gather below, so the consumer learns of the
+                # failure while the other chunks are still extracting. Chunks that extract
+                # zero facts never reach the embedder, so an embeddings outage fails only the
+                # fact-bearing chunks; the consumer must not commit the survivors — the first
+                # batch's commit replaces the document (prior units deleted, original_text
+                # overwritten) and would leave a document with no memories behind.
+                producer_error.append(exc)
+                return
             finally:
                 reset_call_metadata(meta_token)
             extracted = embedded.extracted_facts
@@ -2818,7 +2827,8 @@ async def _streaming_retain_batch(
                     f"[streaming] Producer: skipped {skipped_total}/{total_chunks} already-committed chunks"
                 )
 
-            # Wait for all extractions; collect exceptions
+            # Wait for all extractions. `_extract_one` records its own failures as they
+            # happen; this catches only what escapes it (a cancelled extraction task).
             results = await asyncio.gather(*tasks, return_exceptions=True)
             for r in results:
                 if isinstance(r, BaseException):
@@ -2879,11 +2889,29 @@ async def _streaming_retain_batch(
             except Exception:
                 logger.debug("retain chunk-progress write failed", exc_info=True)
 
+        def _discard_reason() -> str | None:
+            """Why the open batch must not be written, or None if it may be.
+
+            A failed extraction is checked at every commit point, not only at the end: the
+            retain is going to raise, and nothing written after the failure is known can be
+            part of a consistent document. In particular the FIRST batch's commit is what
+            replaces the document (deletes the prior units, overwrites original_text), and a
+            retain that then fails would leave the document emptied with nothing to show for
+            it. Batches committed BEFORE the failure stay: the document has already moved to
+            the new version by then, and their chunk rows are what the recovery gate resumes
+            from when the document is sent again.
+            """
+            if pipeline_aborted[0]:
+                return "pipeline aborted due to concurrent takeover"
+            if producer_error:
+                return "extraction failed, retain will not commit"
+            return None
+
         while True:
             item = await chunk_queue.get()
             if item is None:
                 # Process any remaining items
-                if batch and not pipeline_aborted[0]:
+                if batch and _discard_reason() is None:
                     await _process_db_batch(
                         batch,
                         consumer_batch_idx,
@@ -2904,11 +2932,10 @@ async def _streaming_retain_batch(
             # count alone let a batch of fact-dense chunks grow far past any memory a
             # worker was sized for.
             if len(batch) >= chunk_batch_size or memory_budget.should_flush(batch_bytes):
-                if pipeline_aborted[0]:
-                    # Another request took over the document — discard this batch
+                discard_reason = _discard_reason()
+                if discard_reason is not None:
                     log_buffer.append(
-                        f"[streaming] Consumer: discarding batch of {len(batch)} chunks "
-                        f"(pipeline aborted due to concurrent takeover)"
+                        f"[streaming] Consumer: discarding batch of {len(batch)} chunks ({discard_reason})"
                     )
                     _release_batch(batch)
                     batch = []
