@@ -189,7 +189,7 @@ def test_provider_sync_turn_retains_to_all_write_banks():
     job()
 
     assert retained_banks == ["b1", "b2"]
-    assert provider._pending_retain_ops == {("b1", "op-b1"), ("b2", "op-b2")}
+    assert {(r.bank_id, r.op_id) for r in provider._tracked_retains} == {("b1", "op-b1"), ("b2", "op-b2")}
 
 
 def _provider_with(cfg: dict) -> HindsightMemoryProvider:
@@ -341,14 +341,23 @@ def test_turn_retain_continues_past_a_failing_extra_bank(caplog):
     assert "skipping bank broken" in caplog.text
 
 
-def test_turn_retain_raises_when_the_primary_fails_before_touching_extra_banks():
+def test_turn_retain_keeps_the_payload_when_the_primary_fails_before_touching_extra_banks():
+    """The failed primary write is kept for re-send (it used to raise and be dropped);
+    the extras are still untouched, so the re-send cannot duplicate the item there."""
     provider = _provider_with({"bank_id": "primary", "additional_banks": ["shared"]})
-    written = _fake_retain(provider, failing={"primary"})
+    failing = {"primary"}
+    written = _fake_retain(provider, failing=failing)
 
     provider.sync_turn("User message", "Assistant reply", session_id="s1")
-    with pytest.raises(RuntimeError, match="primary unavailable"):
-        provider._retain_queue.get_nowait()()
+    provider._retain_queue.get_nowait()()
     assert written == ["primary"]
+    (record,) = provider._tracked_retains
+    assert (record.bank_id, record.document_id, record.state, record.op_id) == ("primary", "s1", "requeue", None)
+
+    failing.clear()
+    provider._resend_tracked_retain(record)
+    assert written == ["primary", "primary"]
+    assert (record.state, record.op_id) == ("pending", "op-primary")
 
 
 def test_retain_tool_reports_success_when_only_an_extra_bank_fails():

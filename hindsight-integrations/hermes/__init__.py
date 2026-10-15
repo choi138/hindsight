@@ -20,6 +20,8 @@ import queue
 import sys
 import threading
 import time
+import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -285,6 +287,34 @@ _loop_lock = threading.Lock()
 _WRITER_SENTINEL = object()
 
 
+@dataclass
+class _TrackedRetain:
+    """One retain payload, kept until the server reports it stored.
+
+    ``aretain_batch`` returns on acceptance, and an accepted op can still end ``failed``
+    (an embeddings outage, say). Treating that as done lost the turn for good: later
+    append retains only ship the delta, so nothing ever re-sent it. The payload therefore
+    stays here, re-issuable through ``resend``, until a status poll says ``completed``.
+    """
+
+    bank_id: str
+    document_id: str | None
+    # Re-sends the payload under the given client operation_id. None when a re-send could
+    # store it twice: an older server split the one payload into several ops.
+    resend: Callable[[str], Any] | None
+    # Client-supplied operation_id: the server replays a known id instead of storing the
+    # payload again, so re-sending after a lost acknowledgement is safe.
+    client_op_id: str
+    op_id: str | None = None
+    attempts: int = 0
+    # "pending": polling the server op; "requeue": a re-send is due at ``due_at``.
+    state: str = "pending"
+    # The next-turn prefetch waits only on gated ops, and only until its drain deadline.
+    gated: bool = True
+    due_at: float = 0.0
+    poll_interval: float = 0.0
+
+
 def _get_loop() -> asyncio.AbstractEventLoop:
     """Return a long-lived event loop running on a background thread."""
     global _loop, _loop_thread
@@ -476,6 +506,15 @@ class HindsightMemoryProvider(MemoryProvider):
 
     # Each server-side op status poll is a round trip — coarser than the 0.05s queue poll.
     _RETAIN_OP_POLL_INTERVAL_S = 0.5
+    # One status poll gets its own short budget, independent of the configured request
+    # timeout: a single slow call must not eat the prefetch's whole drain timeout.
+    _RETAIN_OP_STATUS_TIMEOUT_S = 5.0
+    # Writer-thread polls of ops the prefetch no longer waits on: first/max interval,
+    # doubling, so a dead status endpoint costs one short call a minute per op.
+    _RETAIN_OP_BACKGROUND_POLL_S = (5.0, 60.0)
+    # Delay before re-sending a failed retain: first/max seconds, doubling per attempt.
+    _RETAIN_REQUEUE_BACKOFF_S = (10.0, 300.0)
+    _WRITER_IDLE_TICK_S = 1.0
 
     def backup_paths(self) -> List[str]:
         """Legacy shared config + embedded-mode profile env files live under ~/.hindsight."""
@@ -526,11 +565,12 @@ class HindsightMemoryProvider(MemoryProvider):
         self._turn_counter = self._turn_index = 0
         self._session_turns: list[str] = []  # ALL turns for the session
         self._last_retained_turn_count = 0  # append-mode delta watermark
-        # Server-side async retain ops still in flight: aretain_batch returns on
-        # *acceptance*, not durability, so the prefetch gates on these via
-        # get_operation_status (a drained local queue is not a read-after-write signal).
-        self._pending_retain_ops: set[tuple[str, str]] = set()
-        self._pending_retain_ops_lock = threading.Lock()
+        # Retain payloads not yet confirmed stored (see _TrackedRetain): aretain_batch
+        # returns on *acceptance*, not durability, so the prefetch gates on these via
+        # get_operation_status (a drained local queue is not a read-after-write signal)
+        # and the writer re-sends the ones the server marks failed.
+        self._tracked_retains: list[_TrackedRetain] = []
+        self._tracked_retains_lock = threading.Lock()
         self._apply_retain_policy({})
 
         # Recall: pending prefetch block + count, and the indicator state (recall_status()).
@@ -800,8 +840,13 @@ class HindsightMemoryProvider(MemoryProvider):
             },
             {
                 "key": "prefetch_retain_drain_timeout",
-                "description": "Max seconds the background prefetch waits for the retain to become recall-visible (queue drain + server-side completion) before recalling anyway",
-                "default": 10.0,
+                "description": "Max seconds the background prefetch waits for the retain to become recall-visible (queue drain + server-side completion) before recalling anyway; cloud retains commonly take 30-40s",
+                "default": 60.0,
+            },
+            {
+                "key": "retain_max_requeue_attempts",
+                "description": "How many times a retain the server reports as failed (or that could not be sent) is re-sent with growing delays before the plugin gives up and logs the document id for manual recovery",
+                "default": 5,
             },
             {
                 "key": "retain_context",
@@ -944,15 +989,15 @@ class HindsightMemoryProvider(MemoryProvider):
                 )
             return self._client
 
-    def _run_sync(self, coro):
-        """Schedule *coro* on the shared loop using the configured timeout."""
-        return _run_sync(coro, timeout=self._timeout)
+    def _run_sync(self, coro, timeout: float | None = None):
+        """Schedule *coro* on the shared loop using the configured timeout unless given one."""
+        return _run_sync(coro, timeout=self._timeout if timeout is None else timeout)
 
-    def _run_hindsight_operation(self, operation):
+    def _run_hindsight_operation(self, operation, timeout: float | None = None):
         """Run an async client operation; for local_embedded, a stale-daemon
         connection failure recreates the client and retries once."""
         try:
-            return self._run_sync(operation(self._get_client()))
+            return self._run_sync(operation(self._get_client()), timeout)
         except Exception as exc:
             text = f"{type(exc).__name__}: {exc}".lower()
             if self._mode != "local_embedded" or not any(m in text for m in _RETRIABLE_CONNECTION_MARKERS):
@@ -965,7 +1010,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 with contextlib.suppress(Exception):
                     self._run_sync(stale.aclose())
             client = self._get_client()
-            return self._run_sync(operation(client))
+            return self._run_sync(operation(client), timeout)
 
     # -- retain writer thread + server-side visibility -------------------------
 
@@ -988,13 +1033,17 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def _writer_loop(self) -> None:
         """Drain the retain queue serially until the sentinel. A failing job can't
-        kill the writer; task_done() always fires so queue.join() works."""
+        kill the writer; task_done() always fires so queue.join() works. Between
+        jobs the writer also services tracked retains (background status polls,
+        due re-sends), so a retain that fails on the server after the prefetch
+        stopped waiting on it is still noticed and re-sent."""
         while True:
             try:
-                job = self._retain_queue.get(timeout=1.0)
+                job = self._retain_queue.get(timeout=self._WRITER_IDLE_TICK_S)
             except queue.Empty:
                 if self._shutting_down.is_set():
                     return
+                self._service_tracked_retains()
                 continue
             try:
                 if job is _WRITER_SENTINEL:
@@ -1004,6 +1053,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 logger.warning("Hindsight retain failed: %s", exc, exc_info=True)
             finally:
                 self._retain_queue.task_done()
+            self._service_tracked_retains()
 
     def _atexit_shutdown(self) -> None:
         try:
@@ -1012,34 +1062,260 @@ class HindsightMemoryProvider(MemoryProvider):
         except Exception as exc:
             logger.debug("Hindsight atexit shutdown failed: %s", exc)
 
-    def _track_retain_ops(self, retain_response, bank_id: str) -> None:
-        """Record the async ``operation_id``/``operation_ids`` of an aretain_batch reply
-        (pending until recall-visible). No id (older API / sync completion) leaves
-        only the local queue drain as a signal. Keyed per ``(bank_id, op_id)`` so
-        multi-bank writes poll the status endpoint of the bank each op targets."""
-        raw_ids = [
-            getattr(retain_response, "operation_id", None),
-            *(getattr(retain_response, "operation_ids", None) or []),
-        ]
-        if ids := [str(op) for op in raw_ids if op]:
-            with self._pending_retain_ops_lock:
-                self._pending_retain_ops.update((bank_id, op_id) for op_id in ids)
+    def _retain_sender(
+        self, item: dict, *, bank_id: str, document_id: str | None, retain_async: bool
+    ) -> Callable[[str], Any]:
+        """(Re-)sends *item* to one bank. The client operation_id only exists for async
+        retains; a sync retain that raised after the server stored it is sent twice,
+        which beats losing it."""
+        return lambda op_id: self._retain_batch(
+            item,
+            bank_id=bank_id,
+            document_id=document_id,
+            retain_async=retain_async,
+            operation_id=op_id if retain_async else None,
+        )
 
-    def _is_retain_op_complete(self, bank_id: str, op_id: str) -> bool:
-        """True when a server-side retain op is done or gone (completed ops are evicted,
-        so 404 = no longer pending). Transient errors -> False, caller keeps waiting."""
+    def _retain_tracked(
+        self,
+        item: dict,
+        *,
+        bank_id: str,
+        client_op_id: str,
+        document_id: str | None = None,
+        retain_async: bool,
+        gated: bool = True,
+    ) -> None:
+        """Send *item* to *bank_id* and, when async, keep it tracked until the server
+        reports its op completed. *gated* ops also hold the next-turn prefetch."""
+        send = self._retain_sender(item, bank_id=bank_id, document_id=document_id, retain_async=retain_async)
+        resp = send(client_op_id)
+        if retain_async:
+            self._track_retain_ops(
+                resp, bank_id, resend=send, client_op_id=client_op_id, document_id=document_id, gated=gated
+            )
+
+    def _track_retain_ops(
+        self,
+        retain_response,
+        bank_id: str,
+        *,
+        resend: Callable[[str], Any],
+        client_op_id: str,
+        document_id: str | None = None,
+        gated: bool = True,
+    ) -> None:
+        """Track the accepted payload until its server op completes (see ``_TrackedRetain``).
+        No id in the reply (older API / sync completion) means the write already finished.
+        A reply with several ids and no parent predates parent ops: those are tracked for
+        prefetch visibility only, as re-sending the one payload per child would store it
+        more than once. Keyed per bank so multi-bank writes poll the bank each op targets."""
+        parent = getattr(retain_response, "operation_id", None)
+        children = [str(op) for op in (getattr(retain_response, "operation_ids", None) or []) if op]
+        ids = [str(parent)] if parent else children
+        if not ids:
+            return
+        due_at = time.monotonic() + self._RETAIN_OP_BACKGROUND_POLL_S[0]
+        records = [
+            _TrackedRetain(
+                bank_id=bank_id,
+                document_id=document_id,
+                resend=resend if len(ids) == 1 else None,
+                client_op_id=client_op_id,
+                op_id=op_id,
+                gated=gated,
+                due_at=due_at,
+            )
+            for op_id in ids
+        ]
+        with self._tracked_retains_lock:
+            self._tracked_retains.extend(records)
+        # Tool retains run on the caller's thread; the background polls still need the writer.
+        if not self._shutting_down.is_set():
+            self._ensure_writer()
+
+    def _track_unsent_retain(
+        self, item: dict, *, bank_id: str, client_op_id: str, document_id: str | None, retain_async: bool, reason: str
+    ) -> None:
+        """A send that raised is kept and re-sent like a failed op: with its client
+        operation_id the server replays it if the acknowledgement was what got lost."""
+        record = _TrackedRetain(
+            bank_id=bank_id,
+            document_id=document_id,
+            resend=self._retain_sender(item, bank_id=bank_id, document_id=document_id, retain_async=retain_async),
+            client_op_id=client_op_id,
+            state="requeue",
+            gated=False,
+        )
+        with self._tracked_retains_lock:
+            self._tracked_retains.append(record)
+        self._schedule_retain_requeue(record, reason)
+
+    def _gated_retains(self) -> list[_TrackedRetain]:
+        with self._tracked_retains_lock:
+            return [r for r in self._tracked_retains if r.gated and r.state == "pending"]
+
+    def _drop_tracked_retain(self, record: _TrackedRetain) -> None:
+        with self._tracked_retains_lock:
+            if record in self._tracked_retains:
+                self._tracked_retains.remove(record)
+
+    def _retain_op_status(self, bank_id: str, op_id: str) -> str | None:
+        """Server status of a retain op, lower-cased. ``completed`` on a 404: completed
+        ops are evicted. None on a transient error or a poll slower than
+        ``_RETAIN_OP_STATUS_TIMEOUT_S``, so the caller keeps waiting."""
         from hindsight_client_api.exceptions import NotFoundException
 
+        timeout = self._RETAIN_OP_STATUS_TIMEOUT_S
         try:
             resp = self._run_hindsight_operation(
-                lambda client: client.operations.get_operation_status(bank_id=bank_id, operation_id=op_id)
+                lambda client: asyncio.wait_for(
+                    client.operations.get_operation_status(bank_id=bank_id, operation_id=op_id), timeout
+                ),
+                timeout=timeout + 1.0,
             )
         except NotFoundException:
-            return True
+            return "completed"
         except Exception as exc:
-            logger.debug("Prefetch: operation status check failed for %s: %s", op_id, exc)
-            return False
-        return str(getattr(resp, "status", "") or "").lower() in {"completed", "failed"}
+            logger.debug("Retain op %s status check failed: %s", op_id, exc)
+            return None
+        status = str(getattr(resp, "status", "") or "").lower()
+        return "completed" if status == "not_found" else status or None
+
+    def _poll_tracked_retain(self, record: _TrackedRetain, *, background: bool) -> None:
+        """One status poll: ``completed`` releases the payload, ``failed``/``cancelled``
+        schedules a re-send, anything else leaves the op pending. The prefetch polls
+        every half second; *background* (writer) polls back off per op instead."""
+        if record.op_id is None or record.state != "pending":
+            return
+        status = self._retain_op_status(record.bank_id, record.op_id)
+        if status == "completed":
+            self._drop_tracked_retain(record)
+            logger.debug("Hindsight retain op %s (document %s) completed", record.op_id, record.document_id)
+            return
+        low, high = self._RETAIN_OP_BACKGROUND_POLL_S
+        record.poll_interval = min(max(record.poll_interval * 2, low), high) if background else low
+        record.due_at = time.monotonic() + record.poll_interval
+        if status not in {"failed", "cancelled"}:
+            return
+        with self._tracked_retains_lock:
+            # The prefetch and the writer may both poll one op; only one schedules the re-send.
+            if record.state != "pending":
+                return
+            record.state = "requeue"
+        self._schedule_retain_requeue(record, f"server reported the op {status}")
+
+    def _schedule_retain_requeue(self, record: _TrackedRetain, reason: str) -> None:
+        """Arm the next re-send of a ``requeue`` record with exponential backoff, or give
+        up past ``retain_max_requeue_attempts`` (ERROR with the document id: the server
+        keeps a failed op's payload, so the operator can retry it by hand)."""
+        record.gated = False
+        record.attempts += 1
+        if record.resend is None or record.attempts > self._retain_max_requeue_attempts:
+            self._drop_tracked_retain(record)
+            recovery = (
+                f"the server keeps its payload: POST /v1/default/banks/{record.bank_id}"
+                f"/operations/{record.op_id}/retry re-queues it"
+                if record.op_id
+                else "the server never accepted it, so its content is lost"
+            )
+            logger.error(
+                "Hindsight retain of document %s to bank %s gave up after %d attempt(s): %s; %s",
+                record.document_id,
+                record.bank_id,
+                record.attempts,
+                reason,
+                recovery,
+            )
+            return
+        first, cap = self._RETAIN_REQUEUE_BACKOFF_S
+        delay = min(first * 2 ** (record.attempts - 1), cap)
+        record.due_at = time.monotonic() + delay
+        logger.warning(
+            "Hindsight retain of document %s to bank %s (op %s): %s; re-sending in %.0fs (attempt %d/%d)",
+            record.document_id,
+            record.bank_id,
+            record.op_id or "not accepted",
+            reason,
+            delay,
+            record.attempts,
+            self._retain_max_requeue_attempts,
+        )
+
+    def _mark_retain_pending(self, record: _TrackedRetain) -> None:
+        record.state, record.poll_interval = "pending", 0.0
+        record.due_at = time.monotonic() + self._RETAIN_OP_BACKGROUND_POLL_S[0]
+
+    def _resend_tracked_retain(self, record: _TrackedRetain) -> None:
+        """Re-send a ``requeue`` record (writer thread). The server's retry endpoint
+        re-queues an op whose payload it still holds; when the op is gone (pruned, or
+        an older server) the payload goes out again under a fresh client id, because
+        replaying the known one would just hand back the failed op."""
+        if record.state != "requeue" or record.resend is None:
+            return
+        if record.op_id is not None:
+            bank_id, op_id = record.bank_id, record.op_id
+            try:
+                self._run_hindsight_operation(
+                    lambda client: client.operations.retry_operation(bank_id=bank_id, operation_id=op_id)
+                )
+            except Exception as exc:
+                logger.info("Hindsight retain op %s could not be retried server-side (%s); re-sending", op_id, exc)
+                record.op_id, record.client_op_id = None, str(uuid.uuid4())
+            else:
+                self._mark_retain_pending(record)
+                return
+        try:
+            resp = record.resend(record.client_op_id)
+        except Exception as exc:
+            self._schedule_retain_requeue(record, f"re-send failed: {exc!r}")
+            return
+        raw_ids = [getattr(resp, "operation_id", None), *(getattr(resp, "operation_ids", None) or [])]
+        if (op_id := next((str(op) for op in raw_ids if op), None)) is None:
+            # Sync completion / older API: the write finished with the call.
+            self._drop_tracked_retain(record)
+            return
+        record.op_id = op_id
+        self._mark_retain_pending(record)
+
+    def _service_tracked_retains(self) -> None:
+        """Writer-thread tick: due background polls and due re-sends."""
+        now = time.monotonic()
+        with self._tracked_retains_lock:
+            due = [r for r in self._tracked_retains if r.due_at <= now]
+        for record in due:
+            if self._shutting_down.is_set():
+                return
+            try:
+                if record.state == "requeue":
+                    self._resend_tracked_retain(record)
+                else:
+                    self._poll_tracked_retain(record, background=True)
+            except Exception as exc:
+                # Client errors are handled inside; anything else must not kill the writer.
+                logger.warning("Hindsight retain tracking failed for document %s: %s", record.document_id, exc)
+
+    def _flush_retain_requeues(self) -> None:
+        """Last writer job at shutdown: re-sends waiting out their backoff would die with
+        the process, so try each once now, ignoring the delay."""
+        with self._tracked_retains_lock:
+            waiting = [r for r in self._tracked_retains if r.state == "requeue"]
+        for record in waiting:
+            self._resend_tracked_retain(record)
+
+    def _report_abandoned_retains(self) -> None:
+        with self._tracked_retains_lock:
+            abandoned = [r for r in self._tracked_retains if r.state == "requeue"]
+        for record in abandoned:
+            logger.error(
+                "Hindsight retain of document %s to bank %s (op %s) was not re-sent before exit%s",
+                record.document_id,
+                record.bank_id,
+                record.op_id or "not accepted",
+                f"; POST /v1/default/banks/{record.bank_id}/operations/{record.op_id}/retry re-queues it"
+                if record.op_id
+                else "; its content is lost",
+            )
 
     def _wait_for_retains_drained(self, timeout: float) -> bool:
         """Block up to *timeout* s for the last retain to become recall-visible
@@ -1064,40 +1340,37 @@ class HindsightMemoryProvider(MemoryProvider):
         return self._wait_for_server_retain_ops(expired, timeout)
 
     def _wait_for_server_retain_ops(self, _expired: Callable[[], bool], timeout: float) -> bool:
-        """Poll tracked async retain ops until complete or *_expired()* (deadline
-        predicate). Ops still pending at the deadline are DROPPED: keeping them
-        would let a permanently failing status endpoint burn the full timeout on
-        EVERY later prefetch (a per-turn latency penalty via prefetch()'s bounded
-        join). Trades a possibly-stale recall for liveness; WARNING once per prefetch."""
+        """Poll the retain ops the prefetch gates on until none is left or *_expired()*
+        (deadline predicate). Ops still pending at the deadline stop gating — keeping
+        them would let a permanently failing status endpoint burn the full timeout on
+        EVERY later prefetch (a per-turn latency penalty via prefetch()'s bounded join)
+        — but stay tracked: the writer keeps polling them and re-sends any the server
+        marks failed. They used to be dropped outright, which is how a retain that
+        failed after the deadline was never re-sent. WARNING once per prefetch."""
         while True:
-            with self._pending_retain_ops_lock:
-                pending = list(self._pending_retain_ops)
-            if not pending:
+            gated = self._gated_retains()
+            if not gated:
                 return True
             if self._shutting_down.is_set():
                 return False
-            done: set[tuple[str, str]] = set()
-            for bank_id, op_id in pending:
+            for record in gated:
                 if self._shutting_down.is_set():
                     return False
                 if _expired():
                     break
-                if self._is_retain_op_complete(bank_id, op_id):
-                    done.add((bank_id, op_id))
-            with self._pending_retain_ops_lock:
-                self._pending_retain_ops.difference_update(done)
-                if not self._pending_retain_ops:
-                    return True
-                dropped = len(self._pending_retain_ops) if _expired() else 0
-                if dropped:
-                    self._pending_retain_ops.clear()
-            if dropped:
+                self._poll_tracked_retain(record, background=False)
+            remaining = self._gated_retains()
+            if not remaining:
+                return True
+            if _expired():
+                for record in remaining:
+                    record.gated = False
                 logger.warning(
-                    "Prefetch: server retain visibility timed out after %.1fs; "
-                    "dropping %d unresolved op(s) so later prefetches stay "
-                    "bounded (recall may miss the just-completed turn)",
+                    "Prefetch: server retain visibility timed out after %.1fs; %d op(s) still "
+                    "pending are no longer waited on (recall may miss the just-completed turn) "
+                    "but stay tracked and are re-sent if the server marks them failed",
                     timeout,
-                    dropped,
+                    len(remaining),
                 )
                 return False
             time.sleep(self._RETAIN_OP_POLL_INTERVAL_S)
@@ -1391,7 +1664,10 @@ class HindsightMemoryProvider(MemoryProvider):
         # recall-visible; when True it first waits (bounded, off the reply path)
         # for the queue to drain AND the server-side op(s) to complete.
         self._prefetch_waits_for_retain = cfg.get("prefetch_waits_for_retain", True)
-        self._prefetch_retain_drain_timeout = _parse_float_setting(cfg.get("prefetch_retain_drain_timeout"), 10.0)
+        # 60s, not 10: a cloud retain commonly takes 30-40s, and a wait that expired on
+        # every turn made the drain pointless.
+        self._prefetch_retain_drain_timeout = _parse_float_setting(cfg.get("prefetch_retain_drain_timeout"), 60.0)
+        self._retain_max_requeue_attempts = max(0, _parse_int_setting(cfg.get("retain_max_requeue_attempts"), 5))
 
     def _apply_recall_settings(self, cfg: dict) -> None:
         """Recall knobs are pure config too (``{}`` yields the defaults)."""
@@ -1731,24 +2007,33 @@ class HindsightMemoryProvider(MemoryProvider):
         return item
 
     def _retain_batch(
-        self, item: dict, *, bank_id: str, document_id: str | None = None, retain_async: bool | None = None
+        self,
+        item: dict,
+        *,
+        bank_id: str,
+        document_id: str | None = None,
+        retain_async: bool | None = None,
+        operation_id: str | None = None,
     ):
-        """Dispatch one item via aretain_batch (bank_id/document_id/retain_async are
-        call-level args, never item keys)."""
+        """Dispatch one item via aretain_batch (bank_id/document_id/retain_async/
+        operation_id are call-level args, never item keys)."""
         kwargs: Dict[str, Any] = {
             "bank_id": bank_id,
             "items": [item],
             "document_id": document_id,
             "retain_async": retain_async,
+            "operation_id": operation_id,
         }
         kwargs = {k: v for k, v in kwargs.items() if v is not None}
         return self._run_hindsight_operation(lambda client: client.aretain_batch(**kwargs))
 
     def _make_turn_retain_job(
-        self, turns: list[str], *, document_id: str, update_mode: str | None, label: str, track_ops: bool = True
+        self, turns: list[str], *, document_id: str, update_mode: str | None, label: str, gate_prefetch: bool = True
     ) -> Callable[[], None]:
         """Writer job shipping *turns* as one document. Inputs are snapshotted NOW: the
-        writer runs after later sync_turn() calls mutate _session_turns/_turn_index/_session_id."""
+        writer runs after later sync_turn() calls mutate _session_turns/_turn_index/_session_id.
+        *gate_prefetch*: whether the next-turn prefetch waits for this retain (a session
+        flush belongs to the old session, so the new session's prefetch need not)."""
         # One flat message array: the server only chunks by turn (and merges appends)
         # when the document is a list of messages, not a list of per-turn lists.
         content = json.dumps([message for turn in turns for message in json.loads(turn)], ensure_ascii=False)
@@ -1761,6 +2046,9 @@ class HindsightMemoryProvider(MemoryProvider):
         tags = [f"{kind}:{sid}" for kind, sid in lineage if sid] or None
         bank_ids = list(self._write_bank_ids)
         retain_async, retain_context = self._retain_async, self._retain_context
+        # One client operation_id per bank for this payload: a re-send after a lost
+        # acknowledgement then replays the accepted op instead of appending the turns twice.
+        client_op_ids = {bank_id: str(uuid.uuid4()) for bank_id in bank_ids}
 
         def _job() -> None:
             item = self._build_retain_kwargs(
@@ -1783,13 +2071,32 @@ class HindsightMemoryProvider(MemoryProvider):
                     len(content),
                     len(turns),
                 )
-                resp = self._retain_batch(item, bank_id=bank_id, document_id=document_id, retain_async=retain_async)
-                # Async retains are only *accepted* here; track the op id(s) so the
-                # next-turn prefetch can wait for true server-side completion.
-                if retain_async and track_ops:
-                    self._track_retain_ops(resp, bank_id)
+                # Async retains are only *accepted* here; the payload stays tracked until
+                # the server reports the op completed (gated ops also hold the prefetch).
+                self._retain_tracked(
+                    item,
+                    bank_id=bank_id,
+                    client_op_id=client_op_ids[bank_id],
+                    document_id=document_id,
+                    retain_async=retain_async,
+                    gated=gate_prefetch,
+                )
 
-            self._write_to_banks(bank_ids, _write)
+            try:
+                self._write_to_banks(bank_ids, _write)
+            except Exception as exc:
+                # Only the primary raises (extras are isolated and cooled down in
+                # _write_to_banks); dropping it here is what lost turns for good.
+                primary = bank_ids[0]
+                self._track_unsent_retain(
+                    item,
+                    bank_id=primary,
+                    client_op_id=client_op_ids[primary],
+                    document_id=document_id,
+                    retain_async=retain_async,
+                    reason=f"{label} failed: {exc!r}",
+                )
+                return
             logger.debug("Hindsight %s succeeded", label)
 
         return _job
@@ -1903,9 +2210,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 len(content),
                 context,
             )
-            resp = self._retain_batch(item, bank_id=bank_id, retain_async=self._retain_async)
-            if self._retain_async:
-                self._track_retain_ops(resp, bank_id)
+            self._retain_tracked(item, bank_id=bank_id, client_op_id=str(uuid.uuid4()), retain_async=self._retain_async)
 
         self._write_to_banks(list(self._write_bank_ids), _write)
         logger.debug("Tool hindsight_retain: success")
@@ -1955,18 +2260,15 @@ class HindsightMemoryProvider(MemoryProvider):
             return
         document_id, update_mode = self._resolve_retain_target(self._document_id)
         job = self._make_turn_retain_job(
-            list(self._session_turns), document_id=document_id, update_mode=update_mode, label=label, track_ops=False
+            list(self._session_turns),
+            document_id=document_id,
+            update_mode=update_mode,
+            label=label,
+            gate_prefetch=False,
         )
-
-        def _flush() -> None:
-            try:
-                job()
-            except Exception as e:
-                logger.warning("Hindsight %s failed: %s", label, e, exc_info=True)
-
         # Same writer queue as sync_turn: FIFO behind queued retains, no two threads
         # racing aretain_batch on one document, shutdown drain intact.
-        self._enqueue_retain(_flush)
+        self._enqueue_retain(job)
 
     def on_session_switch(
         self, new_session_id: str, *, parent_session_id: str = "", reset: bool = False, **kwargs
@@ -2037,9 +2339,11 @@ class HindsightMemoryProvider(MemoryProvider):
             self._flush_buffered_turns("flush-on-shutdown")
         # Stop accepting retain jobs first so late sync_turn() calls are dropped.
         self._shutting_down.set()
-        # The writer finishes in-flight work then exits on the sentinel; the
-        # bounded join keeps shutdown predictable even if the daemon is wedged.
+        # The writer finishes in-flight work, re-sends what is still waiting out a
+        # backoff, then exits on the sentinel; the bounded join keeps shutdown
+        # predictable even if the daemon is wedged.
         if (writer := self._writer_thread) is not None and writer.is_alive():
+            self._retain_queue.put(self._flush_retain_requeues)
             self._retain_queue.put(_WRITER_SENTINEL)
             writer.join(timeout=10.0)
             if writer.is_alive():
@@ -2047,6 +2351,7 @@ class HindsightMemoryProvider(MemoryProvider):
                     "Hindsight writer did not stop within 10s; abandoning %d pending retain(s)",
                     self._retain_queue.qsize(),
                 )
+        self._report_abandoned_retains()
         self._join_prefetch(5.0)
         with self._prefetch_lock:
             self._prefetch_generation += 1

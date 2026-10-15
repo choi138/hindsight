@@ -300,7 +300,8 @@ The lookup stops at the repository root. Only `bank_id` is read.
 | `retain_user_prefix` | `User` | Label used before user turns in auto-retained transcripts |
 | `retain_assistant_prefix` | `Assistant` | Label used before assistant turns in auto-retained transcripts |
 | `prefetch_waits_for_retain` | `true` | Before the background recall for the next turn, wait until the turn just saved can be found, so recall includes it. Runs off the reply path and adds no response time. |
-| `prefetch_retain_drain_timeout` | `10` | Most seconds that background recall waits for the save above before recalling anyway |
+| `prefetch_retain_drain_timeout` | `60` | Most seconds that background recall waits for the save above before recalling anyway. A cloud save commonly takes 30-40s. |
+| `retain_max_requeue_attempts` | `5` | How many times a save the server later reports as failed (or that could not be sent) is re-sent, with growing delays, before the plugin gives up and logs the document id so you can retry it by hand |
 
 ### Integration
 

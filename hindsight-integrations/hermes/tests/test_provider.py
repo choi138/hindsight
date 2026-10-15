@@ -666,12 +666,14 @@ def test_a_mistyped_number_in_config_falls_back_to_its_default(provider):
             "recall_max_tokens": "lots",
             "recall_max_input_chars": "",
             "prefetch_retain_drain_timeout": "soon",
+            "retain_max_requeue_attempts": "many",
         }
     )
     assert instance._retain_every_n_turns == 1
     assert instance._recall_max_tokens == 4096
     assert instance._recall_max_input_chars == 800
-    assert instance._prefetch_retain_drain_timeout == 10.0
+    assert instance._prefetch_retain_drain_timeout == 60.0
+    assert instance._retain_max_requeue_attempts == 5
 
 
 def test_prompt_does_not_promise_injected_memories_when_auto_recall_is_off(provider):
