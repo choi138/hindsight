@@ -511,6 +511,12 @@ ENV_EMBEDDINGS_MAX_RETRIES = "HINDSIGHT_API_EMBEDDINGS_MAX_RETRIES"
 ENV_EMBEDDINGS_INITIAL_BACKOFF = "HINDSIGHT_API_EMBEDDINGS_INITIAL_BACKOFF"
 ENV_EMBEDDINGS_MAX_BACKOFF = "HINDSIGHT_API_EMBEDDINGS_MAX_BACKOFF"
 ENV_EMBEDDINGS_RETRY_BUDGET = "HINDSIGHT_API_EMBEDDINGS_RETRY_BUDGET"
+# Per-request timeout for the OpenAI-SDK embedding providers (openai, openai-codex,
+# openrouter, requesty). Without it the SDK default of 600s applies to every attempt.
+ENV_EMBEDDINGS_REQUEST_TIMEOUT = "HINDSIGHT_API_EMBEDDINGS_REQUEST_TIMEOUT"
+# How long to park an operation when the embeddings provider reports exhausted
+# quota/credits (a 429 no retry can clear) and gives no reset hint of its own.
+ENV_EMBEDDINGS_QUOTA_DEFER_SECONDS = "HINDSIGHT_API_EMBEDDINGS_QUOTA_DEFER_SECONDS"
 
 # Retry/backoff for remote reranker APIs. Rerank sits on the same synchronous recall
 # path as the query embedding, and with no fallback chain configured (the default) a
@@ -1267,6 +1273,8 @@ DEFAULT_EMBEDDINGS_MAX_RETRIES = 4
 DEFAULT_EMBEDDINGS_INITIAL_BACKOFF = 0.5
 DEFAULT_EMBEDDINGS_MAX_BACKOFF = 4.0
 DEFAULT_EMBEDDINGS_RETRY_BUDGET = 15.0
+DEFAULT_EMBEDDINGS_REQUEST_TIMEOUT = 60.0
+DEFAULT_EMBEDDINGS_QUOTA_DEFER_SECONDS = 900.0
 # Reranker retry defaults: 3 retries (4 attempts) with 0.5s -> 4s exponential backoff
 # and a 10s ceiling on the time one rerank may spend retrying. Tighter than the
 # embedding budget because rerank runs after retrieval has already spent time on the
@@ -2223,6 +2231,19 @@ def _parse_non_negative_float(name: str, raw: str | None, default: float) -> flo
         raise ValueError(f"{name} must be a number, got {raw!r}") from e
     if parsed < 0:
         raise ValueError(f"{name} must be >= 0, got {parsed}")
+    return parsed
+
+
+def _parse_positive_float(name: str, raw: str | None, default: float) -> float:
+    """Parse an env var that must be a positive number of seconds (> 0)."""
+    if raw is None or raw == "":
+        return default
+    try:
+        parsed = float(raw)
+    except ValueError as e:
+        raise ValueError(f"{name} must be a number, got {raw!r}") from e
+    if parsed <= 0:
+        raise ValueError(f"{name} must be > 0, got {parsed}")
     return parsed
 
 
@@ -3701,6 +3722,8 @@ class HindsightConfig:
     embeddings_initial_backoff: float = DEFAULT_EMBEDDINGS_INITIAL_BACKOFF
     embeddings_max_backoff: float = DEFAULT_EMBEDDINGS_MAX_BACKOFF
     embeddings_retry_budget: float = DEFAULT_EMBEDDINGS_RETRY_BUDGET
+    embeddings_request_timeout: float = DEFAULT_EMBEDDINGS_REQUEST_TIMEOUT
+    embeddings_quota_defer_seconds: float = DEFAULT_EMBEDDINGS_QUOTA_DEFER_SECONDS
 
     # Retry/backoff applied to remote reranker API calls (see engine/remote_retry.py's RetryPolicy).
     reranker_max_retries: int = DEFAULT_RERANKER_MAX_RETRIES
@@ -4516,6 +4539,16 @@ class HindsightConfig:
                 ENV_EMBEDDINGS_RETRY_BUDGET,
                 os.getenv(ENV_EMBEDDINGS_RETRY_BUDGET),
                 DEFAULT_EMBEDDINGS_RETRY_BUDGET,
+            ),
+            embeddings_request_timeout=_parse_positive_float(
+                ENV_EMBEDDINGS_REQUEST_TIMEOUT,
+                os.getenv(ENV_EMBEDDINGS_REQUEST_TIMEOUT),
+                DEFAULT_EMBEDDINGS_REQUEST_TIMEOUT,
+            ),
+            embeddings_quota_defer_seconds=_parse_positive_float(
+                ENV_EMBEDDINGS_QUOTA_DEFER_SECONDS,
+                os.getenv(ENV_EMBEDDINGS_QUOTA_DEFER_SECONDS),
+                DEFAULT_EMBEDDINGS_QUOTA_DEFER_SECONDS,
             ),
             reranker_max_retries=_parse_non_negative_int(
                 ENV_RERANKER_MAX_RETRIES,

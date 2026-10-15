@@ -37,6 +37,7 @@ from ..config import (
     DEFAULT_EMBEDDINGS_ONNX_CUDA_DEVICE_ID,
     DEFAULT_EMBEDDINGS_ONNX_DEVICE,
     DEFAULT_EMBEDDINGS_OPENAI_MODEL,
+    DEFAULT_EMBEDDINGS_REQUEST_TIMEOUT,
     DEFAULT_EMBEDDINGS_ZEROENTROPY_BATCH_SIZE,
     DEFAULT_EMBEDDINGS_ZEROENTROPY_DIMENSIONS,
     DEFAULT_EMBEDDINGS_ZEROENTROPY_ENCODING_FORMAT,
@@ -923,6 +924,7 @@ class OpenAIEmbeddings(Embeddings):
         max_retries: int = 3,
         query_prefix: str = "",
         passage_prefix: str = "",
+        timeout: float = DEFAULT_EMBEDDINGS_REQUEST_TIMEOUT,
     ):
         """
         Initialize OpenAI embeddings client.
@@ -936,6 +938,7 @@ class OpenAIEmbeddings(Embeddings):
             max_retries: Maximum number of retries for failed requests (default: 3)
             query_prefix: Prefix prepended to recall/search queries (default: none)
             passage_prefix: Prefix prepended to retained document text (default: none)
+            timeout: Per-request timeout in seconds, applied to every SDK attempt (default: 60.0)
         """
         self.api_key = api_key
         self.model = model
@@ -943,6 +946,7 @@ class OpenAIEmbeddings(Embeddings):
         self.batch_size = batch_size
         self.dimensions = dimensions
         self.max_retries = max_retries
+        self.timeout = timeout
         self.query_prefix = query_prefix
         self.passage_prefix = passage_prefix
         # OpenAI's own embedding models tokenize with cl100k_base, which counts slightly
@@ -990,7 +994,13 @@ class OpenAIEmbeddings(Embeddings):
         # Build client kwargs, only including base_url if set (for Azure or custom endpoints)
         # Parse query parameters from base_url (e.g. ?api-version=xxx for Azure OpenAI)
         # and pass them as default_query so they're included in every request.
-        client_kwargs: dict[str, Any] = {"api_key": self.api_key, "max_retries": self.max_retries}
+        # Without an explicit timeout the SDK waits 600s per attempt, so one stalled
+        # request could hold a retain for (1 + max_retries) x 10 minutes.
+        client_kwargs: dict[str, Any] = {
+            "api_key": self.api_key,
+            "max_retries": self.max_retries,
+            "timeout": self.timeout,
+        }
         if self.base_url:
             parsed = urlparse(self.base_url)
             if parsed.query:
@@ -1076,6 +1086,7 @@ class CodexOAuthEmbeddings(OpenAIEmbeddings):
         max_retries: int = 3,
         query_prefix: str = "",
         passage_prefix: str = "",
+        timeout: float = DEFAULT_EMBEDDINGS_REQUEST_TIMEOUT,
     ):
         from .providers.codex_auth import CodexAuthManager
 
@@ -1089,6 +1100,7 @@ class CodexOAuthEmbeddings(OpenAIEmbeddings):
             max_retries=max_retries,
             query_prefix=query_prefix,
             passage_prefix=passage_prefix,
+            timeout=timeout,
         )
 
     @property
@@ -2269,8 +2281,10 @@ def create_embeddings_from_env() -> Embeddings:
                 base_url=base_url,
                 batch_size=config.embeddings_openai_batch_size,
                 dimensions=config.embeddings_openai_dimensions,
+                max_retries=config.embeddings_max_retries,
                 query_prefix=query_prefix,
                 passage_prefix=passage_prefix,
+                timeout=config.embeddings_request_timeout,
             ),
             config,
         )
@@ -2281,8 +2295,10 @@ def create_embeddings_from_env() -> Embeddings:
                 model=model,
                 batch_size=config.embeddings_openai_batch_size,
                 dimensions=config.embeddings_openai_dimensions,
+                max_retries=config.embeddings_max_retries,
                 query_prefix=query_prefix,
                 passage_prefix=passage_prefix,
+                timeout=config.embeddings_request_timeout,
             ),
             config,
         )
@@ -2300,8 +2316,10 @@ def create_embeddings_from_env() -> Embeddings:
                 base_url="https://openrouter.ai/api/v1",
                 batch_size=config.embeddings_openai_batch_size,
                 dimensions=config.embeddings_openai_dimensions,
+                max_retries=config.embeddings_max_retries,
                 query_prefix=query_prefix,
                 passage_prefix=passage_prefix,
+                timeout=config.embeddings_request_timeout,
             ),
             config,
         )
@@ -2319,8 +2337,10 @@ def create_embeddings_from_env() -> Embeddings:
                 base_url="https://router.requesty.ai/v1",
                 batch_size=config.embeddings_openai_batch_size,
                 dimensions=config.embeddings_openai_dimensions,
+                max_retries=config.embeddings_max_retries,
                 query_prefix=query_prefix,
                 passage_prefix=passage_prefix,
+                timeout=config.embeddings_request_timeout,
             ),
             config,
         )

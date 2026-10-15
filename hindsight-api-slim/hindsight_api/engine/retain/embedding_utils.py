@@ -2,13 +2,65 @@
 Embedding generation utilities for memory units.
 """
 
+import json
 import logging
-from typing import Literal, Protocol
+from datetime import UTC, datetime, timedelta
+from typing import Any, Literal, Protocol
 
 from ...config import ENV_EMBEDDINGS_MAX_INPUT_TOKENS, get_config
+from ..llm_interface import ProviderRateLimitResetError
+from ..remote_retry import status_code_of
 from ..token_encoding import count_tokens, truncate_many_to_tokens
 
 logger = logging.getLogger(__name__)
+
+
+class EmbeddingBatchError(Exception):
+    """An embeddings backend failed for a batch; the provider error is ``__cause__``."""
+
+
+# Phrases providers put in a 429 that means "out of credits", not "slow down":
+# OpenAI's insufficient_quota code and Anthropic/OpenRouter credit wording. Kept
+# to signals a burst limit never carries: OpenAI's per-minute 429 links to the
+# billing page and Gemini's per-minute RESOURCE_EXHAUSTED says "exceeded your
+# current quota ... billing", so neither of those phrases may be used here.
+_QUOTA_EXHAUSTED_MARKERS = (
+    "insufficient_quota",
+    "insufficient credits",
+    "no credits",
+    "credit balance",
+)
+
+
+def _error_text(e: BaseException) -> str:
+    body: Any = getattr(e, "body", None)
+    if isinstance(body, (dict, list)):
+        try:
+            body = json.dumps(body, default=str)
+        except Exception:
+            body = str(body)
+    return f"{e} {body or ''}".lower()
+
+
+def _is_quota_exhausted_rate_limit(e: BaseException) -> bool:
+    if status_code_of(e) != 429:
+        return False
+    text = _error_text(e)
+    return any(marker in text for marker in _QUOTA_EXHAUSTED_MARKERS)
+
+
+def _quota_defer_retry_at(e: BaseException, now: datetime) -> datetime:
+    # openai_compatible_llm is imported here, not at module top: it pulls in the
+    # worker/metrics stack, which imports the engine that imports this package.
+    from openai import APIStatusError
+
+    from ..providers.openai_compatible_llm import _rate_limit_retry_at
+
+    hinted = _rate_limit_retry_at(e) if isinstance(e, APIStatusError) else None
+    if hinted is not None and hinted > now:
+        return hinted
+    return now + timedelta(seconds=get_config().embeddings_quota_defer_seconds)
+
 
 EmbeddingInputType = Literal["document", "query"]
 
@@ -135,8 +187,16 @@ async def generate_embeddings_batch(
 
     try:
         embeddings = await _encode_with_input_type(embeddings_backend, texts, input_type)
+    except ProviderRateLimitResetError:
+        raise
     except Exception as e:
-        raise Exception(f"Failed to generate batch embeddings: {str(e)}")
+        if _is_quota_exhausted_rate_limit(e):
+            retry_at = _quota_defer_retry_at(e, datetime.now(UTC))
+            raise ProviderRateLimitResetError(
+                retry_at=retry_at,
+                message=f"Embeddings provider quota exhausted; retry at {retry_at.isoformat()}: {e}",
+            ) from e
+        raise EmbeddingBatchError(f"Failed to generate batch embeddings: {e}") from e
 
     # Guarantee 1:1 alignment with input texts. A silent length mismatch here
     # propagates downstream as zip() drops items, eventually surfacing as an
