@@ -859,6 +859,8 @@ ENV_CONSOLIDATION_MAX_MEMORIES_PER_ROUND = "HINDSIGHT_API_CONSOLIDATION_MAX_MEMO
 ENV_CONSOLIDATION_LLM_BATCH_SIZE = "HINDSIGHT_API_CONSOLIDATION_LLM_BATCH_SIZE"
 ENV_CONSOLIDATION_DEDUP_THRESHOLD = "HINDSIGHT_API_CONSOLIDATION_DEDUP_THRESHOLD"
 ENV_CONSOLIDATION_LLM_PARALLELISM = "HINDSIGHT_API_CONSOLIDATION_LLM_PARALLELISM"
+ENV_CONSOLIDATION_RECALL_MAX_CONCURRENT = "HINDSIGHT_API_CONSOLIDATION_RECALL_MAX_CONCURRENT"
+ENV_CONSOLIDATION_REQUEUE_DELAY_SECONDS = "HINDSIGHT_API_CONSOLIDATION_REQUEUE_DELAY_SECONDS"
 ENV_CONSOLIDATION_MAX_TOKENS = "HINDSIGHT_API_CONSOLIDATION_MAX_TOKENS"
 ENV_CONSOLIDATION_MAX_COMPLETION_TOKENS = "HINDSIGHT_API_CONSOLIDATION_MAX_COMPLETION_TOKENS"
 ENV_CONSOLIDATION_SOURCE_FACTS_MAX_TOKENS = "HINDSIGHT_API_CONSOLIDATION_SOURCE_FACTS_MAX_TOKENS"
@@ -1766,6 +1768,18 @@ DEFAULT_CONSOLIDATION_LLM_PARALLELISM = (
     4  # Max tag groups consolidated concurrently per op. Locks on overlapping write
     # scopes degrade to sequential automatically; matches retain_max_concurrent.
 )
+# Max consolidation recalls in flight per process, across every running consolidation op.
+# Without this cap each LLM batch fans out one recall per fact, so llm_batch_size x
+# llm_parallelism (8 x 4 = 32 by default) recalls can run at once, each holding up to
+# recall_connection_budget DB connections and a recall_max_concurrent slot. On a small
+# pool (e.g. HINDSIGHT_API_DB_POOL_MAX_SIZE=5) that starves user recalls with acquire
+# timeouts. Keep this <= db_pool_max_size / recall_connection_budget so consolidation
+# can never take the whole pool.
+DEFAULT_CONSOLIDATION_RECALL_MAX_CONCURRENT = 4
+# Seconds a round-limited consolidation waits before its re-queued continuation becomes
+# claimable (0 = immediately, the historical behaviour). Gives user traffic a window
+# between rounds on a bank with a large backlog.
+DEFAULT_CONSOLIDATION_REQUEUE_DELAY_SECONDS = 0.0
 DEFAULT_CONSOLIDATION_MAX_TOKENS = 512  # Max tokens for recall when finding related observations
 # Unset by default: the key is omitted from the LLM call so every provider keeps its current implicit output
 # budget — 100% backwards compatible. Operators on providers with a low hidden default (notably Bedrock imported
@@ -3458,6 +3472,8 @@ class HindsightConfig:
     consolidation_max_memories_per_round: int
     consolidation_llm_batch_size: int
     consolidation_llm_parallelism: int
+    consolidation_recall_max_concurrent: int
+    consolidation_requeue_delay_seconds: float
     consolidation_max_tokens: int
     consolidation_max_completion_tokens: int | None
     consolidation_recall_budget: str
@@ -5074,6 +5090,24 @@ class HindsightConfig:
                     os.getenv(
                         ENV_CONSOLIDATION_LLM_PARALLELISM,
                         str(DEFAULT_CONSOLIDATION_LLM_PARALLELISM),
+                    )
+                ),
+            ),
+            consolidation_recall_max_concurrent=max(
+                1,
+                int(
+                    os.getenv(
+                        ENV_CONSOLIDATION_RECALL_MAX_CONCURRENT,
+                        str(DEFAULT_CONSOLIDATION_RECALL_MAX_CONCURRENT),
+                    )
+                ),
+            ),
+            consolidation_requeue_delay_seconds=max(
+                0.0,
+                float(
+                    os.getenv(
+                        ENV_CONSOLIDATION_REQUEUE_DELAY_SECONDS,
+                        str(DEFAULT_CONSOLIDATION_REQUEUE_DELAY_SECONDS),
                     )
                 ),
             ),

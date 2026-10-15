@@ -231,6 +231,12 @@ _MM_HISTORY_KIND_FAILURE = "refresh_failed"
 #: inherit somebody else's wait. ``_clear_refresh_park`` does that.
 _REFRESH_AUTOMATIC_KEY = "_automatic"
 
+#: Task-payload key marking a consolidation the caller asked for (POST /consolidate), as
+#: opposed to one a write, the reconcile sweep or a round-limit continuation queued.
+#: Only automatic runs stop when ``enable_auto_consolidation`` is off; the flag is
+#: carried through the round-limit re-queue so an explicit run drains the whole bank.
+_CONSOLIDATION_CALLER_REQUESTED_KEY = "_caller_requested"
+
 
 def refresh_serialization_key(mental_model_id: str) -> str:
     """The claim-time serialisation key for a mental model's refreshes.
@@ -3052,6 +3058,10 @@ class MemoryEngine(MemoryEngineInterface):
         # Backpressure mechanism: limit concurrent searches to prevent overwhelming the database
         # Configurable via HINDSIGHT_API_RECALL_MAX_CONCURRENT (default: 50)
         self._search_semaphore = asyncio.Semaphore(get_config().recall_max_concurrent)
+        # Consolidation's per-fact recalls get their own, much smaller cap so a running
+        # consolidation cannot take every DB connection and every _search_semaphore
+        # slot from user recalls (see DEFAULT_CONSOLIDATION_RECALL_MAX_CONCURRENT).
+        self._consolidation_recall_semaphore = asyncio.Semaphore(get_config().consolidation_recall_max_concurrent)
 
         # Backpressure for retain DB writes: limit concurrent transactions to prevent contention
         # on entity/link tables. Acquired in the orchestrator *after* LLM extraction completes,
@@ -4311,6 +4321,23 @@ class MemoryEngine(MemoryEngineInterface):
             api_key_id=task_dict.get("_api_key_id"),
             retry_count=task_dict.get("_retry_count", 0),
         )
+        caller_requested = bool(task_dict.get(_CONSOLIDATION_CALLER_REQUESTED_KEY))
+        if not caller_requested:
+            # Automatic runs re-check the flag when claimed, so turning auto-consolidation
+            # off also stops the rows queued before the flip (a round-limit chain's
+            # continuation in particular), not only new triggers.
+            config = await self._config_resolver.resolve_full_config(bank_id, internal_context)
+            if not config.enable_auto_consolidation:
+                logger.info(
+                    f"[CONSOLIDATION] bank={bank_id} skipping queued automatic consolidation: "
+                    "enable_auto_consolidation is false"
+                )
+                return {
+                    "status": "skipped",
+                    "bank_id": bank_id,
+                    "memories_processed": 0,
+                    "reason": "auto_consolidation_disabled",
+                }
         result = await run_consolidation_job(
             memory_engine=self,
             bank_id=bank_id,
@@ -4318,6 +4345,7 @@ class MemoryEngine(MemoryEngineInterface):
             operation_id=task_dict.get("operation_id"),
             observation_scopes=task_dict.get("observation_scopes"),
             pending_refresh_tags=task_dict.get("pending_refresh_tags"),
+            caller_requested=caller_requested,
         )
 
         logger.info(f"[CONSOLIDATION] bank={bank_id} completed: {result.get('memories_processed', 0)} processed")
@@ -22074,6 +22102,7 @@ class MemoryEngine(MemoryEngineInterface):
         dedupe_in_flight_payload_key: str | None = None,
         dedupe_in_flight_includes_processing: bool = True,
         serialization_key: str | None = None,
+        next_retry_at: datetime | None = None,
     ) -> dict[str, Any]:
         """Generic helper to submit an async operation.
 
@@ -22105,6 +22134,10 @@ class MemoryEngine(MemoryEngineInterface):
                 oldest claimable pending peer goes first (see ``key_serialization_sql``). Dedupe
                 decides whether a *row* is created; this decides whether a created row may run
                 beside its peers. Leave None for work whose runs are independent.
+            next_retry_at: Written to the row's ``next_retry_at`` column, which the claim query
+                filters on (``next_retry_at IS NULL OR next_retry_at <= NOW()``), so the new row
+                is not claimable before that time. Not a retry: ``retry_count`` stays 0 and no
+                error is recorded.
 
         Returns:
             Dict with operation_id and optionally deduplicated=True if an existing task was found
@@ -22223,20 +22256,31 @@ class MemoryEngine(MemoryEngineInterface):
                             # UPDATE here: dedupe_by_bank holds FOR NO KEY UPDATE on the
                             # bank row, serialising concurrent submits for this bank.
                             incoming_tags = full_payload.get("pending_refresh_tags")
+                            row_changed = False
                             if incoming_tags:
                                 existing_tags = row_dict.get("pending_refresh_tags") or []
                                 merged_tags = sorted(set(existing_tags) | set(incoming_tags))
                                 if merged_tags != existing_tags:
                                     row_dict["pending_refresh_tags"] = merged_tags
-                                    await conn.execute(
-                                        f"""
-                                        UPDATE {fq_table("async_operations")}
-                                        SET task_payload = $1::jsonb, updated_at = now()
-                                        WHERE operation_id = $2
-                                        """,
-                                        json.dumps(row_dict, default=_json_default),
-                                        row["operation_id"],
-                                    )
+                                    row_changed = True
+                            # An explicit (caller-requested) run folded into a pending automatic
+                            # one must keep its explicit status, or the consolidation handler
+                            # would drop the surviving row when auto-consolidation is disabled.
+                            if full_payload.get(_CONSOLIDATION_CALLER_REQUESTED_KEY) and not row_dict.get(
+                                _CONSOLIDATION_CALLER_REQUESTED_KEY
+                            ):
+                                row_dict[_CONSOLIDATION_CALLER_REQUESTED_KEY] = True
+                                row_changed = True
+                            if row_changed:
+                                await conn.execute(
+                                    f"""
+                                    UPDATE {fq_table("async_operations")}
+                                    SET task_payload = $1::jsonb, updated_at = now()
+                                    WHERE operation_id = $2
+                                    """,
+                                    json.dumps(row_dict, default=_json_default),
+                                    row["operation_id"],
+                                )
                             logger.debug(
                                 f"{operation_type} task already {row['status']} for bank_id={bank_id}, "
                                 f"skipping duplicate (existing operation_id={row['operation_id']})"
@@ -22302,8 +22346,8 @@ class MemoryEngine(MemoryEngineInterface):
                     f"""
                     INSERT INTO {fq_table("async_operations")}
                         (operation_id, bank_id, operation_type, result_metadata, status,
-                         task_payload, serialization_key)
-                    VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)
+                         task_payload, serialization_key, next_retry_at)
+                    VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8)
                     """,
                     operation_id,
                     bank_id,
@@ -22312,6 +22356,7 @@ class MemoryEngine(MemoryEngineInterface):
                     "pending",
                     json.dumps(full_payload, default=_json_default),
                     serialization_key,
+                    next_retry_at,
                 )
 
         # For SyncTaskBackend: executes the task immediately.
@@ -22780,6 +22825,7 @@ class MemoryEngine(MemoryEngineInterface):
         observation_scopes: list[list[str]] | None = None,
         pending_refresh_tags: list[str] | None = None,
         caller_requested: bool = False,
+        defer_seconds: float = 0.0,
     ) -> dict[str, Any]:
         """Submit a consolidation operation to run asynchronously.
 
@@ -22796,6 +22842,11 @@ class MemoryEngine(MemoryEngineInterface):
                 every affected mental model exactly once (#3411). Not a caller-facing knob.
             caller_requested: True when the caller asked for this run (the HTTP endpoint),
                 which a tag-scoped caller may not; False for the runs writes queue themselves.
+                Recorded in the payload and carried through the round-limit re-queue, so an
+                explicit run keeps draining the bank when ``enable_auto_consolidation`` is
+                off — that flag stops only automatic chains.
+            defer_seconds: Set by the round-limit re-queue only — how long the new row stays
+                unclaimable (``next_retry_at``), from ``consolidation_requeue_delay_seconds``.
 
         Returns:
             Dict with operation_id
@@ -22827,6 +22878,8 @@ class MemoryEngine(MemoryEngineInterface):
             task_payload["observation_scopes"] = observation_scopes
         if pending_refresh_tags is not None:
             task_payload["pending_refresh_tags"] = pending_refresh_tags
+        if caller_requested:
+            task_payload[_CONSOLIDATION_CALLER_REQUESTED_KEY] = True
 
         # Skip bank-level deduplication when scoped — the caller wants a
         # targeted run that should not be merged into a pending full-bank sweep.
@@ -22838,6 +22891,7 @@ class MemoryEngine(MemoryEngineInterface):
             task_type="consolidation",
             task_payload=task_payload,
             dedupe_by_bank=dedupe,
+            next_retry_at=(datetime.now(UTC) + timedelta(seconds=defer_seconds)) if defer_seconds > 0 else None,
         )
 
     async def submit_async_graph_maintenance(

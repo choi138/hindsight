@@ -1473,6 +1473,7 @@ async def run_consolidation_job(
     operation_id: str | None = None,
     observation_scopes: list[list[str]] | None = None,
     pending_refresh_tags: list[str] | None = None,
+    caller_requested: bool = False,
 ) -> dict[str, Any]:
     """
     Run consolidation job for a bank.
@@ -1490,6 +1491,9 @@ async def run_consolidation_job(
         pending_refresh_tags: Tags of memories consolidated by earlier rounds of this
             round-limited chain, carried through the re-queue so the final round can
             refresh every affected mental model exactly once (#3411).
+        caller_requested: True when the caller explicitly asked for this run. An
+            explicit run re-queues past the round limit regardless of
+            ``enable_auto_consolidation``; an automatic one stops when that flag is off.
 
     Returns:
         Dict with consolidation results
@@ -1517,6 +1521,7 @@ async def run_consolidation_job(
             operation_id,
             observation_scopes,
             pending_refresh_tags,
+            caller_requested,
         )
     finally:
         if trace_token is not None:
@@ -1535,6 +1540,7 @@ async def _run_consolidation_job(
     operation_id: str | None = None,
     observation_scopes: list[list[str]] | None = None,
     pending_refresh_tags: list[str] | None = None,
+    caller_requested: bool = False,
 ) -> dict[str, Any]:
     """Core consolidation flow. See ``run_consolidation_job`` for the public entrypoint."""
     perf = ConsolidationPerfLog(bank_id)
@@ -1801,14 +1807,25 @@ async def _run_consolidation_job(
                                     existing_updated = existing.get(
                                         "updated", 1 if existing.get("action") == "updated" else 0
                                     )
+                                    existing_merged = existing.get(
+                                        "merged", 1 if existing.get("action") == "merged" else 0
+                                    )
                                     new_created = new.get("created", 1 if new.get("action") == "created" else 0)
                                     new_updated = new.get("updated", 1 if new.get("action") == "updated" else 0)
-                                    total = existing_created + existing_updated + new_created + new_updated
+                                    new_merged = new.get("merged", 1 if new.get("action") == "merged" else 0)
+                                    total = (
+                                        existing_created
+                                        + existing_updated
+                                        + existing_merged
+                                        + new_created
+                                        + new_updated
+                                        + new_merged
+                                    )
                                     sub_results[i] = {
                                         "action": "multiple",
                                         "created": existing_created + new_created,
                                         "updated": existing_updated + new_updated,
-                                        "merged": 0,
+                                        "merged": existing_merged + new_merged,
                                         "total_actions": total,
                                     }
                 else:
@@ -2085,16 +2102,27 @@ async def _run_consolidation_job(
 
     if hit_round_limit:
         remaining = total_count - stats["memories_processed"]
-        logger.info(
-            f"[CONSOLIDATION] bank={bank_id} hit round limit of {max_memories_per_round} memories,"
-            f" ~{remaining} remaining. Re-queuing consolidation."
-        )
-        await memory_engine.submit_async_consolidation(
-            bank_id=bank_id,
-            request_context=request_context,
-            observation_scopes=observation_scopes,
-            pending_refresh_tags=sorted(all_refresh_tags) or None,
-        )
+        if not caller_requested and not config.enable_auto_consolidation:
+            # The flag is re-read here, on the config as it is now, so flipping it off
+            # stops a running automatic chain after the current round instead of only
+            # stopping new triggers.
+            logger.info(
+                f"[CONSOLIDATION] bank={bank_id} hit round limit of {max_memories_per_round} memories,"
+                f" ~{remaining} remaining. Not re-queuing: enable_auto_consolidation is false."
+            )
+        else:
+            logger.info(
+                f"[CONSOLIDATION] bank={bank_id} hit round limit of {max_memories_per_round} memories,"
+                f" ~{remaining} remaining. Re-queuing consolidation."
+            )
+            await memory_engine.submit_async_consolidation(
+                bank_id=bank_id,
+                request_context=request_context,
+                observation_scopes=observation_scopes,
+                pending_refresh_tags=sorted(all_refresh_tags) or None,
+                caller_requested=caller_requested,
+                defer_seconds=config.consolidation_requeue_delay_seconds,
+            )
 
     # Build summary
     perf.log(
@@ -2459,6 +2487,7 @@ async def _process_memory_batch(
     # verdict adjudicated) with no connection held, and only then written.
     per_memory_created: set[str] = set()
     per_memory_updated: set[str] = set()
+    per_memory_merged: set[str] = set()
 
     mem_by_id = {str(m["id"]): m for m in memories}
 
@@ -2720,7 +2749,7 @@ async def _process_memory_batch(
                                     config.consolidation_dedup_threshold,
                                 )
                                 for m in prepared_create.source_mems:
-                                    per_memory_created.add(str(m["id"]))
+                                    per_memory_merged.add(str(m["id"]))
                                 continue
 
                         action = await _apply_create_action(
@@ -2759,14 +2788,20 @@ async def _process_memory_batch(
     results: list[dict[str, Any]] = []
     for m in memories:
         mid = str(m["id"])
-        created = mid in per_memory_created
-        updated = mid in per_memory_updated
-        if created and updated:
-            results.append({"action": "multiple", "created": 1, "updated": 1, "merged": 0, "total_actions": 2})
+        created = int(mid in per_memory_created)
+        updated = int(mid in per_memory_updated)
+        merged = int(mid in per_memory_merged)
+        total = created + updated + merged
+        if total > 1:
+            results.append(
+                {"action": "multiple", "created": created, "updated": updated, "merged": merged, "total_actions": total}
+            )
         elif created:
             results.append({"action": "created"})
         elif updated:
             results.append({"action": "updated"})
+        elif merged:
+            results.append({"action": "merged"})
         else:
             results.append({"action": "skipped", "reason": "no_durable_knowledge"})
 
@@ -3109,27 +3144,31 @@ async def _find_related_observations(
     recall_budget = Budget(config.consolidation_recall_budget)
 
     try:
-        recall_result = await memory_engine.recall_async(
-            bank_id=bank_id,
-            query=query,
-            budget=recall_budget,
-            max_tokens=config.consolidation_max_tokens,  # Token budget for observations (configurable)
-            fact_type=["observation"],  # Only retrieve observations
-            request_context=request_context,
-            tags=tags,  # Filter by source memory's tags
-            tags_match=tags_match,  # Use strict matching for security
-            include_source_facts=True,  # Embed source facts so we avoid a separate DB fetch
-            max_source_facts_tokens=config.consolidation_source_facts_max_tokens,
-            max_source_facts_tokens_per_observation=config.consolidation_source_facts_max_tokens_per_observation,
-            # Round-robin interleave fusion (no cross-encoder): consolidation is looking
-            # for an existing near-identical observation to merge into. Both the
-            # cross-encoder (semantic #1 -> reranked #37) and RRF (semantic #1 -> outside
-            # the 512-token budget) were measured to bury that twin; interleave guarantees
-            # each retrieval arm's top hits a slot, so the semantic-#1 twin is always shown
-            # to the LLM, which then UPDATEs instead of creating a duplicate.
-            reranking="interleave",
-            _quiet=True,  # Suppress logging
-        )
+        # Every fact of an LLM batch recalls concurrently, and batches run in parallel
+        # across groups and ops, so without this cap consolidation alone can hold the
+        # whole DB pool and starve user recalls (see consolidation_recall_max_concurrent).
+        async with memory_engine._consolidation_recall_semaphore:
+            recall_result = await memory_engine.recall_async(
+                bank_id=bank_id,
+                query=query,
+                budget=recall_budget,
+                max_tokens=config.consolidation_max_tokens,  # Token budget for observations (configurable)
+                fact_type=["observation"],  # Only retrieve observations
+                request_context=request_context,
+                tags=tags,  # Filter by source memory's tags
+                tags_match=tags_match,  # Use strict matching for security
+                include_source_facts=True,  # Embed source facts so we avoid a separate DB fetch
+                max_source_facts_tokens=config.consolidation_source_facts_max_tokens,
+                max_source_facts_tokens_per_observation=config.consolidation_source_facts_max_tokens_per_observation,
+                # Round-robin interleave fusion (no cross-encoder): consolidation is looking
+                # for an existing near-identical observation to merge into. Both the
+                # cross-encoder (semantic #1 -> reranked #37) and RRF (semantic #1 -> outside
+                # the 512-token budget) were measured to bury that twin; interleave guarantees
+                # each retrieval arm's top hits a slot, so the semantic-#1 twin is always shown
+                # to the LLM, which then UPDATEs instead of creating a duplicate.
+                reranking="interleave",
+                _quiet=True,  # Suppress logging
+            )
     finally:
         if recall_span:
             recall_span.end()
